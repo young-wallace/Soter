@@ -128,30 +128,51 @@ export class ClaimsService {
       throw new NotFoundException('Campaign not found');
     }
 
-    await this.budgetService.assertWithinBudget(
-      createClaimDto.campaignId,
-      createClaimDto.amount,
-    );
+    // Budget enforcement + claim creation + the ledger entry that records
+    // the new lock all happen inside one transaction. reserveBudget() takes
+    // a row lock on the campaign first, so two concurrent creates against
+    // the same campaign are serialized here rather than racing on a
+    // read-then-write: the second transaction blocks until the first
+    // commits its `lock` ledger entry, and only then re-sums usage.
+    const claim = await this.prisma.$transaction(async tx => {
+      await this.budgetService.reserveBudget(
+        tx,
+        createClaimDto.campaignId,
+        createClaimDto.amount,
+      );
 
-    const claim = await this.prisma.claim.create({
-      data: {
-        campaignId: createClaimDto.campaignId,
-        amount: createClaimDto.amount,
-        recipientRef: this.encryptionService.encrypt(
-          createClaimDto.recipientRef,
-        ),
-        evidenceRef: createClaimDto.evidenceRef,
-        importJobId: createClaimDto.importJobId,
-        importRowNumber: createClaimDto.importRowNumber,
-        expiresAt:
-          createClaimDto.expiresAt ??
-          new Date(
-            Date.now() + DEFAULT_CLAIM_EXPIRY_DAYS * 24 * 60 * 60 * 1000,
+      const created = await tx.claim.create({
+        data: {
+          campaignId: createClaimDto.campaignId,
+          amount: createClaimDto.amount,
+          recipientRef: this.encryptionService.encrypt(
+            createClaimDto.recipientRef,
           ),
-      },
-      include: {
-        campaign: true,
-      },
+          evidenceRef: createClaimDto.evidenceRef,
+          importJobId: createClaimDto.importJobId,
+          importRowNumber: createClaimDto.importRowNumber,
+          expiresAt:
+            createClaimDto.expiresAt ??
+            new Date(
+              Date.now() + DEFAULT_CLAIM_EXPIRY_DAYS * 24 * 60 * 60 * 1000,
+            ),
+        },
+        include: {
+          campaign: true,
+        },
+      });
+
+      await tx.balanceLedger.create({
+        data: {
+          campaignId: createClaimDto.campaignId,
+          claimId: created.id,
+          eventType: 'lock',
+          amount: created.amount,
+          note: `Claim ${created.id} created; locked against campaign budget`,
+        },
+      });
+
+      return created;
     });
 
     claim.recipientRef = this.encryptionService.decrypt(claim.recipientRef);
